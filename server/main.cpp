@@ -31,6 +31,9 @@ void init_database()
         exit(1);
     }
 
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", 0, 0, 0);
+    sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", 0, 0, 0);
+
     const char *sql =
         "CREATE TABLE IF NOT EXISTS users ("
         "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -41,7 +44,7 @@ void init_database()
         "    name TEXT NOT NULL,"
         "    current_bid REAL DEFAULT 0.0,"
         "    bidder_id INTEGER,"
-        "    version INTEGER DEFAULT 1);" 
+        "    version INTEGER DEFAULT 1);"
         "CREATE TABLE IF NOT EXISTS bids ("
         "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "    item_id INTEGER NOT NULL,"
@@ -74,14 +77,26 @@ struct Item
     double current_bid = 0.0;
     int bidder_id = -1;
     int version = 1;
-    queue<pair<int, double>> bid_queue; // user_id, bid_amount
+    queue<pair<int, double>> bid_queue;
+};
+
+class ItemsMonitor
+{
+private:
+    mutex mtx;
+    condition_variable cv;
+
+public:
+    unique_lock<mutex> get_lock() { return unique_lock<mutex>(mtx); }
+    void wait(unique_lock<mutex> &lock) { cv.wait(lock); }
+    void notify() { cv.notify_one(); }
 };
 
 mutex sessions_mutex;
-mutex items_mutex;
 mutex clients_mutex;
-unordered_map<string, UserSession> active_sessions; // session_token -> UserSession
-unordered_map<int, Item> items;                     // item_id -> Item
+ItemsMonitor items_monitor;
+unordered_map<string, UserSession> active_sessions;
+unordered_map<int, Item> items;
 vector<shared_ptr<ix::WebSocket>> connected_clients;
 
 // --------------------------
@@ -96,23 +111,36 @@ string generate_uuid()
 
     stringstream ss;
     ss << hex;
-    for (int i = 0; i < 8; i++) ss << dis(gen);
+    for (int i = 0; i < 8; i++)
+        ss << dis(gen);
     ss << "-";
-    for (int i = 0; i < 4; i++) ss << dis(gen);
+    for (int i = 0; i < 4; i++)
+        ss << dis(gen);
     ss << "-4";
-    for (int i = 0; i < 3; i++) ss << dis(gen);
+    for (int i = 0; i < 3; i++)
+        ss << dis(gen);
     ss << "-";
     ss << dis2(gen);
-    for (int i = 0; i < 3; i++) ss << dis(gen);
+    for (int i = 0; i < 3; i++)
+        ss << dis(gen);
     ss << "-";
-    for (int i = 0; i < 12; i++) ss << dis(gen);
+    for (int i = 0; i < 12; i++)
+        ss << dis(gen);
     return ss.str();
 }
 
-void broadcast(const string& message) {
-    lock_guard<mutex> lock(clients_mutex);
-    for (auto& client : connected_clients) {
-        if (client) client->send(message);
+void broadcast(const string &message)
+{
+    vector<shared_ptr<ix::WebSocket>> clients_copy;
+    {
+        lock_guard<mutex> lock(clients_mutex);
+        clients_copy = connected_clients;
+    }
+
+    for (auto &client : clients_copy)
+    {
+        if (client)
+            client->send(message);
     }
 }
 
@@ -135,7 +163,8 @@ int authenticate_user(const string &username, const string &password)
     sqlite3_bind_text(stmt, 2, password.c_str(), -1, SQLITE_STATIC);
 
     int user_id = -1;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+    {
         user_id = sqlite3_column_int(stmt, 0);
     }
 
@@ -146,6 +175,9 @@ int authenticate_user(const string &username, const string &password)
 void load_items_from_db()
 {
     lock_guard<mutex> db_lock(db_mutex);
+    auto lock = items_monitor.get_lock();
+    items.clear();
+
     sqlite3_stmt *stmt;
     const char *sql = "SELECT id, name, current_bid, bidder_id, version FROM items";
 
@@ -163,43 +195,27 @@ void load_items_from_db()
         item.current_bid = sqlite3_column_double(stmt, 2);
         item.bidder_id = sqlite3_column_int(stmt, 3);
         item.version = sqlite3_column_int(stmt, 4);
-
-        lock_guard<mutex> items_lock(items_mutex);
         items[item.id] = item;
     }
+
     sqlite3_finalize(stmt);
 }
 
 void seed_test_data()
 {
     lock_guard<mutex> db_lock(db_mutex);
+    // In production: Use proper password hashing (e.g., bcrypt)
+    const char *users_sql =
+        "INSERT OR IGNORE INTO users (username, password_hash) VALUES "
+        "('user1', 'pass1'), ('user2', 'pass2'), ('admin', 'admin');";
+    sqlite3_exec(db, users_sql, 0, 0, 0);
 
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM users", -1, &stmt, nullptr) == SQLITE_OK)
-    {
-        if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0)
-        {
-            const char *users_sql =
-                "INSERT INTO users (username, password_hash) VALUES "
-                "('user1', 'pass1'), ('user2', 'pass2'), ('admin', 'admin');";
-            sqlite3_exec(db, users_sql, 0, 0, 0);
-        }
-        sqlite3_finalize(stmt);
-    }
-
-    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM items", -1, &stmt, nullptr) == SQLITE_OK)
-    {
-        if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0)
-        {
-            const char *items_sql =
-                "INSERT INTO items (name, current_bid) VALUES "
-                "('Antique Chair', 100.0), "
-                "('Vintage Painting', 500.0), "
-                "('Rare Coin Collection', 1000.0);";
-            sqlite3_exec(db, items_sql, 0, 0, 0);
-        }
-        sqlite3_finalize(stmt);
-    }
+    const char *items_sql =
+        "INSERT OR IGNORE INTO items (name, current_bid) VALUES "
+        "('Antique Chair', 100.0), "
+        "('Vintage Painting', 500.0), "
+        "('Rare Coin Collection', 1000.0);";
+    sqlite3_exec(db, items_sql, 0, 0, 0);
 }
 
 // --------------------------
@@ -207,32 +223,43 @@ void seed_test_data()
 // --------------------------
 void process_bid(Item &item, int user_id, double amount)
 {
-    lock_guard<mutex> db_lock(db_mutex);
+    const auto timeout = chrono::seconds(5);
+    const auto start = chrono::steady_clock::now();
     bool success = false;
 
-    sqlite3_exec(db, "BEGIN IMMEDIATE", 0, 0, 0);
-
-    sqlite3_stmt *check_stmt;
-    const char *check_sql = "SELECT current_bid, version FROM items WHERE id = ?";
-    if (sqlite3_prepare_v2(db, check_sql, -1, &check_stmt, nullptr) == SQLITE_OK)
+    while (!success && chrono::steady_clock::now() - start < timeout)
     {
+        lock_guard<mutex> db_lock(db_mutex);
+        sqlite3_exec(db, "BEGIN IMMEDIATE", 0, 0, 0);
+
+        sqlite3_stmt *check_stmt;
+        const char *check_sql = "SELECT current_bid, version FROM items WHERE id = ?";
+
+        if (sqlite3_prepare_v2(db, check_sql, -1, &check_stmt, nullptr) != SQLITE_OK)
+        {
+            sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+            continue;
+        }
+
         sqlite3_bind_int(check_stmt, 1, item.id);
         if (sqlite3_step(check_stmt) == SQLITE_ROW)
         {
             double current_bid = sqlite3_column_double(check_stmt, 0);
             int db_version = sqlite3_column_int(check_stmt, 1);
-            
+
             if (amount > current_bid && db_version == item.version)
             {
-                const char *update_sql = "UPDATE items SET current_bid = ?, bidder_id = ?, version = ? WHERE id = ?";
                 sqlite3_stmt *update_stmt;
+                const char *update_sql =
+                    "UPDATE items SET current_bid = ?, bidder_id = ?, version = ? WHERE id = ?";
+
                 if (sqlite3_prepare_v2(db, update_sql, -1, &update_stmt, nullptr) == SQLITE_OK)
                 {
                     sqlite3_bind_double(update_stmt, 1, amount);
                     sqlite3_bind_int(update_stmt, 2, user_id);
                     sqlite3_bind_int(update_stmt, 3, db_version + 1);
                     sqlite3_bind_int(update_stmt, 4, item.id);
-                    
+
                     if (sqlite3_step(update_stmt) == SQLITE_DONE)
                     {
                         success = true;
@@ -243,40 +270,47 @@ void process_bid(Item &item, int user_id, double amount)
             }
         }
         sqlite3_finalize(check_stmt);
+
+        if (success)
+        {
+            sqlite3_exec(db, "COMMIT", 0, 0, 0);
+
+            sqlite3_stmt *insert_stmt;
+            const char *insert_sql =
+                "INSERT INTO bids (item_id, user_id, amount) VALUES (?, ?, ?)";
+            if (sqlite3_prepare_v2(db, insert_sql, -1, &insert_stmt, nullptr) == SQLITE_OK)
+            {
+                sqlite3_bind_int(insert_stmt, 1, item.id);
+                sqlite3_bind_int(insert_stmt, 2, user_id);
+                sqlite3_bind_double(insert_stmt, 3, amount);
+                sqlite3_step(insert_stmt);
+                sqlite3_finalize(insert_stmt);
+            }
+        }
+        else
+        {
+            sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+        }
     }
 
     if (success)
     {
         item.current_bid = amount;
         item.bidder_id = user_id;
-        
-        stringstream update_msg;
-        update_msg << "ITEM_UPDATE|" << item.id << "," << item.name << "," 
-                   << item.current_bid << "," << item.bidder_id;
-        broadcast(update_msg.str());
-        
-        // Insert bid history
-        sqlite3_stmt *insert_stmt;
-        const char *insert_sql = "INSERT INTO bids (item_id, user_id, amount) VALUES (?, ?, ?)";
-        if (sqlite3_prepare_v2(db, insert_sql, -1, &insert_stmt, nullptr) == SQLITE_OK)
-        {
-            sqlite3_bind_int(insert_stmt, 1, item.id);
-            sqlite3_bind_int(insert_stmt, 2, user_id);
-            sqlite3_bind_double(insert_stmt, 3, amount);
-            sqlite3_step(insert_stmt);
-            sqlite3_finalize(insert_stmt);
-        }
+        broadcast("ITEM_UPDATE|" + to_string(item.id) + "," + item.name + "," + to_string(item.current_bid) + "," + to_string(item.bidder_id));
     }
-
-    sqlite3_exec(db, success ? "COMMIT" : "ROLLBACK", 0, 0, 0);
 }
 
-void add_item(const string& name) {
+void add_item(const string &name, double starting_bid)
+{
     lock_guard<mutex> db_lock(db_mutex);
     sqlite3_stmt *stmt;
-    const char *sql = "INSERT INTO items (name) VALUES (?)";
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+    const char *sql = "INSERT INTO items (name, current_bid) VALUES (?, ?)";
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK)
+    {
         sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_double(stmt, 2, starting_bid);
         sqlite3_step(stmt);
         sqlite3_finalize(stmt);
     }
@@ -301,10 +335,21 @@ vector<string> split_string(const string &s, char delimiter)
 void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
 {
     vector<string> parts = split_string(msg, '|');
-    if (parts.empty()) return;
+    if (parts.empty())
+        return;
 
     try
     {
+        // Update session activity
+        if (parts[0] != "GET_ITEMS" && parts.size() > 3)
+        {
+            lock_guard<mutex> session_lock(sessions_mutex);
+            if (auto it = active_sessions.find(parts[3]); it != active_sessions.end())
+            {
+                it->second.last_activity = chrono::steady_clock::now();
+            }
+        }
+
         if (parts[0] == "LOGIN" && parts.size() == 3)
         {
             string username = parts[1];
@@ -319,7 +364,19 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
                     active_sessions[session_token] = {user_id, chrono::steady_clock::now()};
                 }
                 ws->send("LOGIN_SUCCESS|" + session_token + "|" + to_string(user_id));
-                ws->send("GET_ITEMS");
+    
+                // Proper items list handling
+                auto lock = items_monitor.get_lock();
+                stringstream response;
+                response << "ITEMS_LIST";
+                for (const auto &[id, item] : items) {
+                    response << "|" << id << "," 
+                             << item.name << ","
+                             << item.current_bid << ","
+                             << item.version;
+                }
+                ws->send(response.str());
+                
             }
             else
             {
@@ -328,12 +385,12 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
         }
         else if (parts[0] == "GET_ITEMS")
         {
-            lock_guard<mutex> lock(items_mutex);
+            auto lock = items_monitor.get_lock();
             stringstream response;
             response << "ITEMS_LIST";
             for (const auto &[id, item] : items)
             {
-                response << "|" << item.id << "," << item.name << "," 
+                response << "|" << id << "," << item.name << ","
                          << item.current_bid << "," << item.version;
             }
             ws->send(response.str());
@@ -347,47 +404,62 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
             int user_id = -1;
             {
                 lock_guard<mutex> lock(sessions_mutex);
-                auto it = active_sessions.find(session_token);
-                if (it != active_sessions.end()) user_id = it->second.user_id;
+                if (auto it = active_sessions.find(session_token); it != active_sessions.end())
+                {
+                    user_id = it->second.user_id;
+                }
             }
 
-            if (user_id == -1) {
+            if (user_id == -1)
+            {
                 ws->send("ERROR|Invalid session");
                 return;
             }
 
+            auto lock = items_monitor.get_lock();
+            if (items.find(item_id) != items.end())
             {
-                lock_guard<mutex> lock(items_mutex);
-                if (items.find(item_id) != items.end()) {
-                    items[item_id].bid_queue.emplace(user_id, amount);
-                    ws->send("ACK|Bid queued");
-                } else {
-                    ws->send("ERROR|Invalid item ID");
-                }
+                items[item_id].bid_queue.emplace(user_id, amount);
+                items_monitor.notify();
+                ws->send("ACK|Bid queued");
+            }
+            else
+            {
+                ws->send("ERROR|Invalid item ID");
             }
         }
-        else if (parts[0] == "ADMIN" && parts.size() >= 3)
+        else if (parts[0] == "ADMIN" && parts.size() == 5 && parts[2] == "ADD_ITEM")
         {
             string session_token = parts[1];
             int user_id = -1;
             {
                 lock_guard<mutex> lock(sessions_mutex);
-                auto it = active_sessions.find(session_token);
-                if (it != active_sessions.end()) user_id = it->second.user_id;
+                if (auto it = active_sessions.find(session_token); it != active_sessions.end())
+                {
+                    user_id = it->second.user_id;
+                }
             }
 
-            if (user_id != 1) { // Assuming admin has user_id 1
+            if (user_id != 1)
+            {
                 ws->send("ERROR|Admin privileges required");
                 return;
             }
 
-            if (parts[2] == "ADD_ITEM" && parts.size() == 4) {
-                add_item(parts[3]);
+            try
+            {
+                double starting_bid = stod(parts[4]);
+                add_item(parts[3], starting_bid);
                 ws->send("ADMIN_SUCCESS|Item added: " + parts[3]);
+            }
+            catch (...)
+            {
+                ws->send("ERROR|Invalid starting bid");
             }
         }
     }
-    catch (const exception &e) {
+    catch (const exception &e)
+    {
         ws->send("ERROR|Invalid message format");
     }
 }
@@ -399,17 +471,28 @@ void bid_processor_thread()
 {
     while (true)
     {
-        this_thread::sleep_for(chrono::milliseconds(100));
+        auto lock = items_monitor.get_lock();
+        bool processed = false;
 
-        lock_guard<mutex> lock(items_mutex);
         for (auto &[item_id, item] : items)
         {
             if (!item.bid_queue.empty())
             {
                 auto [user_id, amount] = item.bid_queue.front();
                 item.bid_queue.pop();
+                lock.unlock();
+
                 process_bid(item, user_id, amount);
+
+                lock.lock();
+                processed = true;
+                break;
             }
+        }
+
+        if (!processed)
+        {
+            items_monitor.wait(lock);
         }
     }
 }
@@ -419,9 +502,9 @@ void session_cleanup_thread()
     while (true)
     {
         this_thread::sleep_for(chrono::minutes(5));
-
         lock_guard<mutex> lock(sessions_mutex);
         auto now = chrono::steady_clock::now();
+
         for (auto it = active_sessions.begin(); it != active_sessions.end();)
         {
             if (now - it->second.last_activity > chrono::hours(1))
@@ -451,25 +534,66 @@ int main()
     thread(bid_processor_thread).detach();
     thread(session_cleanup_thread).detach();
 
-    server.setOnConnectionCallback(
-        [&](weak_ptr<ix::WebSocket> weakWebSocket,
-            shared_ptr<ix::ConnectionState> connectionState)
-        {
-            if (auto webSocket = weakWebSocket.lock())
+    server.setOnConnectionCallback([&](weak_ptr<ix::WebSocket> weak_ws, shared_ptr<ix::ConnectionState> state)
+                                   {
+        auto ws = weak_ws.lock();
+        if (ws) {
             {
-                webSocket->setOnMessageCallback(
-                    [weakWebSocket](const ix::WebSocketMessagePtr &msg)
-                    {
-                        if (auto ws = weakWebSocket.lock())
-                        {
-                            if (msg->type == ix::WebSocketMessageType::Message)
-                            {
-                                handle_message(msg->str, ws);
-                            }
-                        }
-                    });
+                lock_guard<mutex> lock(clients_mutex);
+                connected_clients.push_back(ws);
             }
-        });
+
+            ws->setOnMessageCallback([weak_ws](const ix::WebSocketMessagePtr& msg) {
+                if (msg->type == ix::WebSocketMessageType::Message) {
+                    if (auto ws = weak_ws.lock()) {
+                        handle_message(msg->str, ws);
+                    }
+                }
+            });
+
+// Update the connection callback section:
+server.setOnConnectionCallback(
+    [&](weak_ptr<ix::WebSocket> weakWebSocket,
+        shared_ptr<ix::ConnectionState> connectionState)
+    {
+        auto webSocket = weakWebSocket.lock();
+        if (webSocket)
+        {
+            // Add to connected clients
+            {
+                lock_guard<mutex> lock(clients_mutex);
+                connected_clients.push_back(webSocket);
+            }
+
+            // Set message callback
+            webSocket->setOnMessageCallback(
+                [weakWebSocket](const ix::WebSocketMessagePtr& msg)
+                {
+                    auto ws = weakWebSocket.lock();
+                    if (!ws) return;
+
+                    // Handle close event
+                    if (msg->type == ix::WebSocketMessageType::Close)
+                    {
+                        lock_guard<mutex> lock(clients_mutex);
+                        auto it = find(connected_clients.begin(), 
+                                    connected_clients.end(), ws);
+                        if (it != connected_clients.end())
+                        {
+                            connected_clients.erase(it);
+                        }
+                        return;
+                    }
+
+                    // Handle other message types
+                    if (msg->type == ix::WebSocketMessageType::Message)
+                    {
+                        handle_message(msg->str, ws);
+                    }
+                });
+        }
+    });
+        } });
 
     auto res = server.listen();
     if (!res.first)
@@ -477,13 +601,9 @@ int main()
         cerr << "Error starting server: " << res.second << endl;
         return 1;
     }
+
     server.start();
-
     cout << "Server running on port 8080\n";
-    cout << "Test users:\n";
-    cout << "  user1/pass1\n  user2/pass2\n  admin/admin\n";
-    cout << "Sample items preloaded with IDs 1-3\n";
-
     while (true)
         this_thread::sleep_for(chrono::seconds(1));
 }
