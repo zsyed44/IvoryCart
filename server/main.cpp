@@ -650,123 +650,134 @@ void add_item(const string &name, const string &description, const string &listi
 
 int create_order(int user_id, const vector<pair<Item, int>> &items, bool from_cart = true)
 {
-    lock_guard<mutex> db_lock(db_mutex);
-    sqlite3_exec(db, "BEGIN IMMEDIATE", 0, 0, 0);
-    
-    // Calculate total amount
-    double total = 0.0;
-    for (const auto &[item, quantity] : items) {
-        if (item.listing_type == "fixed") {
-            total += item.fixed_price * quantity;
-        } else {
-            total += item.current_bid;  // For auction items, just use winning bid
+    int order_id = -1;
+
+    {
+        lock_guard<mutex> db_lock(db_mutex);
+        sqlite3_exec(db, "BEGIN IMMEDIATE", 0, 0, 0);
+
+        // Step 1: Calculate total
+        double total = 0.0;
+        for (const auto &[item, quantity] : items) {
+            total += (item.listing_type == "fixed") ? item.fixed_price * quantity : item.current_bid;
         }
-    }
-    
-    // Create order
-    sqlite3_stmt *order_stmt;
-    const char *order_sql = "INSERT INTO orders (user_id, total_amount) VALUES (?, ?)";
-    
-    if (sqlite3_prepare_v2(db, order_sql, -1, &order_stmt, nullptr) != SQLITE_OK) {
-        sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
-        return -1;
-    }
-    
-    sqlite3_bind_int(order_stmt, 1, user_id);
-    sqlite3_bind_double(order_stmt, 2, total);
-    
-    if (sqlite3_step(order_stmt) != SQLITE_DONE) {
+        cerr << "[ORDER CREATE] Step total passed" << endl;
+
+        // Step 2: Insert into orders
+        sqlite3_stmt *order_stmt;
+        const char *order_sql = "INSERT INTO orders (user_id, total_amount) VALUES (?, ?)";
+        if (sqlite3_prepare_v2(db, order_sql, -1, &order_stmt, nullptr) != SQLITE_OK) {
+            sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+            cerr << "[ORDER CREATE] Failed to prepare order insert" << endl;
+            return -1;
+        }
+
+        sqlite3_bind_int(order_stmt, 1, user_id);
+        sqlite3_bind_double(order_stmt, 2, total);
+
+        if (sqlite3_step(order_stmt) != SQLITE_DONE) {
+            sqlite3_finalize(order_stmt);
+            sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+            cerr << "[ORDER CREATE] Failed to insert order" << endl;
+            return -1;
+        }
+
         sqlite3_finalize(order_stmt);
-        sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
-        return -1;
-    }
-    
-    sqlite3_finalize(order_stmt);
-    int order_id = sqlite3_last_insert_rowid(db);
-    
-    // Add order items
-    for (const auto &[item, quantity] : items) {
-        sqlite3_stmt *item_stmt;
-        const char *item_sql = 
-            "INSERT INTO order_items (order_id, item_id, quantity, price, is_auction) "
-            "VALUES (?, ?, ?, ?, ?)";
-        
-        if (sqlite3_prepare_v2(db, item_sql, -1, &item_stmt, nullptr) != SQLITE_OK) {
-            sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
-            return -1;
-        }
-        
-        sqlite3_bind_int(item_stmt, 1, order_id);
-        sqlite3_bind_int(item_stmt, 2, item.id);
-        sqlite3_bind_int(item_stmt, 3, quantity);
-        
-        if (item.listing_type == "fixed") {
-            sqlite3_bind_double(item_stmt, 4, item.fixed_price);
-            sqlite3_bind_int(item_stmt, 5, 0);  // not auction
-        } else {
-            sqlite3_bind_double(item_stmt, 4, item.current_bid);
-            sqlite3_bind_int(item_stmt, 5, 1);  // is auction
-        }
-        
-        if (sqlite3_step(item_stmt) != SQLITE_DONE) {
+        order_id = sqlite3_last_insert_rowid(db);
+        cerr << "[ORDER CREATE] Step orders passed" << endl;
+
+        // Step 3: Insert order items + inventory update
+        for (const auto &[item, quantity] : items) {
+            sqlite3_stmt *item_stmt;
+            const char *item_sql =
+                "INSERT INTO order_items (order_id, item_id, quantity, price, is_auction) "
+                "VALUES (?, ?, ?, ?, ?)";
+
+            if (sqlite3_prepare_v2(db, item_sql, -1, &item_stmt, nullptr) != SQLITE_OK) {
+                sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+                cerr << "[ORDER CREATE] Failed to prepare order item insert" << endl;
+                return -1;
+            }
+
+            sqlite3_bind_int(item_stmt, 1, order_id);
+            sqlite3_bind_int(item_stmt, 2, item.id);
+            sqlite3_bind_int(item_stmt, 3, quantity);
+            sqlite3_bind_double(item_stmt, 4, (item.listing_type == "fixed") ? item.fixed_price : item.current_bid);
+            sqlite3_bind_int(item_stmt, 5, (item.listing_type == "auction") ? 1 : 0);
+
+            if (sqlite3_step(item_stmt) != SQLITE_DONE) {
+                sqlite3_finalize(item_stmt);
+                sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+                cerr << "[ORDER CREATE] Failed to insert order item" << endl;
+                return -1;
+            }
+
             sqlite3_finalize(item_stmt);
-            sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
-            return -1;
-        }
-        
-        sqlite3_finalize(item_stmt);
-        
-        // Update inventory for fixed-price items
-        if (item.listing_type == "fixed") {
-            sqlite3_stmt *update_stmt;
-            const char *update_sql = 
-                "UPDATE items SET inventory = inventory - ? WHERE id = ? AND inventory >= ?";
-            
-            if (sqlite3_prepare_v2(db, update_sql, -1, &update_stmt, nullptr) != SQLITE_OK) {
-                sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
-                return -1;
-            }
-            
-            sqlite3_bind_int(update_stmt, 1, quantity);
-            sqlite3_bind_int(update_stmt, 2, item.id);
-            sqlite3_bind_int(update_stmt, 3, quantity);
-            
-            if (sqlite3_step(update_stmt) != SQLITE_DONE) {
+            cerr << "[ORDER CREATE] Order item created" << endl;
+
+            // Decrease inventory for fixed-price items
+            if (item.listing_type == "fixed") {
+                sqlite3_stmt *update_stmt;
+                const char *update_sql =
+                    "UPDATE items SET inventory = inventory - ? WHERE id = ? AND inventory >= ?";
+
+                if (sqlite3_prepare_v2(db, update_sql, -1, &update_stmt, nullptr) != SQLITE_OK) {
+                    sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+                    cerr << "[ORDER CREATE] Failed to prepare inventory update" << endl;
+                    return -1;
+                }
+
+                sqlite3_bind_int(update_stmt, 1, quantity);
+                sqlite3_bind_int(update_stmt, 2, item.id);
+                sqlite3_bind_int(update_stmt, 3, quantity);
+
+                if (sqlite3_step(update_stmt) != SQLITE_DONE) {
+                    sqlite3_finalize(update_stmt);
+                    sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+                    cerr << "[ORDER CREATE] Failed to update inventory" << endl;
+                    return -1;
+                }
+
                 sqlite3_finalize(update_stmt);
+                cerr << "[ORDER CREATE] Inventory updated" << endl;
+            }
+        }
+
+        // Step 4: Clear cart
+        if (from_cart) {
+            sqlite3_stmt *clear_stmt;
+            const char *clear_sql = "DELETE FROM cart WHERE user_id = ?";
+
+            if (sqlite3_prepare_v2(db, clear_sql, -1, &clear_stmt, nullptr) != SQLITE_OK) {
                 sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+                cerr << "[ORDER CREATE] Failed to prepare cart clear" << endl;
                 return -1;
             }
-            
-            sqlite3_finalize(update_stmt);
-        }
-    }
-    
-    // Clear cart if order was created from cart
-    if (from_cart) {
-        sqlite3_stmt *clear_stmt;
-        const char *clear_sql = "DELETE FROM cart WHERE user_id = ?";
-        
-        if (sqlite3_prepare_v2(db, clear_sql, -1, &clear_stmt, nullptr) != SQLITE_OK) {
-            sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
-            return -1;
-        }
-        
-        sqlite3_bind_int(clear_stmt, 1, user_id);
-        
-        if (sqlite3_step(clear_stmt) != SQLITE_DONE) {
+
+            sqlite3_bind_int(clear_stmt, 1, user_id);
+
+            if (sqlite3_step(clear_stmt) != SQLITE_DONE) {
+                sqlite3_finalize(clear_stmt);
+                sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+                cerr << "[ORDER CREATE] Failed to clear cart" << endl;
+                return -1;
+            }
+
             sqlite3_finalize(clear_stmt);
-            sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
-            return -1;
+            cerr << "[ORDER CREATE] Cleared cart" << endl;
         }
-        
-        sqlite3_finalize(clear_stmt);
-    }
-    
-    sqlite3_exec(db, "COMMIT", 0, 0, 0);
-    load_items_from_db();  // Reload items to update inventory changes
-    
+
+        sqlite3_exec(db, "COMMIT", 0, 0, 0);
+        cerr << "[ORDER CREATE] Commit" << endl;
+    } // 🔓 db_mutex lock released here
+
+    // Step 5: Reload items AFTER unlocking DB mutex to avoid freeze
+    load_items_from_db();
+    cerr << "[ORDER CREATE] Loaded from DB" << endl;
+
     return order_id;
 }
+
 
 bool process_payment(int order_id, const string &payment_method, const string &transaction_id)
 {
@@ -1113,7 +1124,9 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
                 return;
             }
             
+            cout << "[CHECKOUT] Received checkout for user: " << user_id << endl;
             int order_id = create_order(user_id, cart_items);
+            cout << "[CHECKOUT] Order ID returned: " << order_id << endl;
             if (order_id > 0)
             {
                 ws->send("ORDER_CREATED|" + to_string(order_id));
