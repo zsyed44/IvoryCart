@@ -83,6 +83,7 @@ function App() {
       if (socket) {
         socket.send('GET_ITEMS');
         socket.send(`GET_CART|${rest[0]}`);
+        socket.send(`GET_ORDERS|${rest[0]}`);
       }
     } else if (type === 'GET_ITEMS') {
       // Server is requesting items, send them
@@ -213,6 +214,8 @@ function App() {
         };
       });
       setOrders(newOrders);
+      console.log("ORDERS_LIST fired:", rest);
+      console.log("Parsed orders:", newOrders);
     } else if (type === 'ACK') {
       // Acknowledge message, no action needed
     } else {
@@ -242,6 +245,7 @@ function App() {
         };
 
         ws.onmessage = (event) => {
+          console.log("[WS] Raw message from server:", event.data);
           if (!isMounted) return;
           handleMessage(event);
         };
@@ -707,7 +711,7 @@ function App() {
     );
   };
 
-  const OrdersView = () => (
+  const OrdersView = ({orders}: { orders: Order[] }) => (
     <div className="card shadow-sm">
       <div className="card-body">
         <h3 className="h5 mb-4">Order History</h3>
@@ -892,7 +896,7 @@ function App() {
                   </div>
                 )}
                 
-                {activeTab === 'orders' && <OrdersView />}
+                {activeTab === 'orders' && <OrdersView orders={orders}/>}
               </div>
 
               <div className="col-lg-4">

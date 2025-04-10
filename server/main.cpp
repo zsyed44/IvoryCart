@@ -223,6 +223,15 @@ int authenticate_user(const string &username, const string &password)
     return user_id;
 }
 
+string join(const vector<string> &vec, const string &delimiter) {
+    stringstream ss;
+    for (size_t i = 0; i < vec.size(); ++i) {
+        if (i > 0) ss << delimiter;
+        ss << vec[i];
+    }
+    return ss.str();
+}
+
 void load_items_from_db()
 {
     lock_guard<mutex> db_lock(db_mutex);
@@ -1131,6 +1140,10 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
             {
                 ws->send("ORDER_CREATED|" + to_string(order_id));
                 send_cart_update_to_user(user_id);
+
+                ostringstream ordersList;
+                ordersList << "GET_ORDERS|" << session_token;
+                handle_message(ordersList.str(), ws);
             }
             else
             {
@@ -1165,6 +1178,9 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
             if (process_payment(order_id, payment_method, transaction_id))
             {
                 ws->send("PAYMENT_SUCCESS|" + transaction_id);
+                ostringstream ordersList;
+                ordersList << "GET_ORDERS|" << session_token;
+                handle_message(ordersList.str(), ws);
             }
             else
             {
@@ -1173,51 +1189,81 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
         }
         else if (parts[0] == "GET_ORDERS" && parts.size() == 2)
         {
+            cout << "[GET_ORDERS] Fetching orders for token: " << parts[1] << endl;
             string session_token = parts[1];
 
             int user_id = -1;
             {
                 lock_guard<mutex> lock(sessions_mutex);
-                if (auto it = active_sessions.find(session_token); it != active_sessions.end())
-                {
+                if (auto it = active_sessions.find(session_token); it != active_sessions.end()) {
                     user_id = it->second.user_id;
+                    cout << "[GET_ORDERS] Found user ID: " << user_id << endl;
                 }
             }
 
-            if (user_id == -1)
-            {
+            if (user_id == -1) {
                 ws->send("ERROR|Invalid session");
                 return;
             }
 
-            // Query orders for this user
             lock_guard<mutex> db_lock(db_mutex);
             sqlite3_stmt *stmt;
-            const char *sql = "SELECT id, total_amount, status, created_at FROM orders WHERE user_id = ?";
 
-            if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
-            {
+            const char *sql =
+                "SELECT o.id, o.total_amount, o.status, "
+                "oi.item_id, oi.quantity, oi.price "
+                "FROM orders o "
+                "JOIN order_items oi ON o.id = oi.order_id "
+                "WHERE o.user_id = ? "
+                "ORDER BY o.id DESC";
+
+            if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
                 ws->send("ERROR|Failed to fetch orders");
                 return;
             }
 
             sqlite3_bind_int(stmt, 1, user_id);
 
-            stringstream response;
-            response << "ORDERS";
+            // Group items by order ID
+            map<int, tuple<double, string, vector<string>>> orderMap;
             while (sqlite3_step(stmt) == SQLITE_ROW)
             {
-                int id = sqlite3_column_int(stmt, 0);
+                int orderId = sqlite3_column_int(stmt, 0);
                 double total = sqlite3_column_double(stmt, 1);
                 const char *status = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
-                const char *created_at = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 3));
+                int itemId = sqlite3_column_int(stmt, 3);
+                int quantity = sqlite3_column_int(stmt, 4);
+                double price = sqlite3_column_double(stmt, 5);
 
-                response << "|" << id << "," << total << "," << status << "," << created_at;
+                orderMap[orderId] = make_tuple(total, status, vector<string>{}); // initialize if not present
+                std::get<2>(orderMap[orderId]).push_back(
+                    to_string(itemId) + ":" + to_string(quantity) + ":" + to_string(price));
+
+                cout << "[GET_ORDERS] Order row → "
+                << sqlite3_column_int(stmt, 0) << " | "
+                << sqlite3_column_double(stmt, 1) << " | "
+                << reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)) << endl;
+               
             }
 
             sqlite3_finalize(stmt);
+
+            stringstream response;
+            response << "ORDERS_LIST";
+
+            for (const auto &[id, tup] : orderMap)
+            {
+                double total = get<0>(tup);
+                const string &status = get<1>(tup);
+                const vector<string> &items = get<2>(tup);
+                response << "|" << id << "," << total << "," << status << "," << join(items, ";");
+            }
+            cout << "[GET_ORDERS] Final message to client: " << response.str() << endl;
+
             ws->send(response.str());
+            cout << "[DEBUG] Sending ORDERS_LIST: " << response.str() << endl;
         }
+
         else if (parts[0] == "ADMIN" && parts.size() >= 5 && parts[2] == "ADD_ITEM")
         {
             string session_token = parts[1];
