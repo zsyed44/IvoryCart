@@ -11,6 +11,7 @@ struct User {
     std::string email;
     std::string passwordHash;
     std::string sessionId;
+    bool isAdmin;
 };
 
 struct Product {
@@ -18,6 +19,7 @@ struct Product {
     std::string name;
     double price;
     int stock;
+    int soldOutThreshold;
 };
 
 struct Order {
@@ -48,13 +50,18 @@ using Storage = decltype(sql::make_storage("dummy.db",
         sql::make_column("email", &User::email, sql::unique()),
         sql::make_column("passwordHash", &User::passwordHash),
         sql::make_column("sessionId", &User::sessionId)),
+        make_column("isAdmin", &User::isAdmin)
+    ),
     sql::make_table("Products",
-        sql::make_column("id", &Product::id, sql::primary_key().autoincrement()),
-        sql::make_column("name", &Product::name),
-        sql::make_column("price", &Product::price),
-        sql::make_column("stock", &Product::stock))
-    // Add others here...
-));
+        make_column("id", &Product::id, primary_key().autoincrement()),
+        make_column("name", &Product::name),
+        make_column("price", &Product::price),
+        make_column("stock", &Product::stock),
+        make_column("soldOutThreshold", &Product::soldOutThreshold)
+    )
+);
+
+#endif
 
 // Declare initStorage function
 Storage initStorage(const std::string& filename);
