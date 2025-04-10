@@ -113,6 +113,7 @@ struct UserSession {
     int user_id;
     chrono::steady_clock::time_point last_activity;
     unordered_map<int, CartItem> cart;  // Maps item_id to CartItem
+    weak_ptr<ix::WebSocket> ws;
 };
 
 struct Item
@@ -577,6 +578,43 @@ vector<pair<Item, int>> get_cart_items(int user_id)
     return cart_items;
 }
 
+void send_cart_update_to_user(int user_id)
+{
+    string cart_message;
+
+    {
+        lock_guard<mutex> lock(sessions_mutex);
+        for (const auto &[token, session] : active_sessions)
+        {
+            if (session.user_id == user_id)
+            {
+                auto cart_items = get_cart_items(user_id);
+                stringstream response;
+                response << "CART_ITEMS";
+
+                double total = 0.0;
+                for (const auto &[item, quantity] : cart_items)
+                {
+                    response << "|" << item.id << "," 
+                             << item.name << ","
+                             << item.fixed_price << ","
+                             << quantity;
+                    total += item.fixed_price * quantity;
+                }
+                response << "|TOTAL," << total;
+                cart_message = response.str();
+
+                if (auto ws_ptr = session.ws.lock())
+                {
+                    ws_ptr->send(cart_message);
+                }
+                break;
+            }
+        }
+    }
+}
+
+
 void add_item(const string &name, const string &description, const string &listing_type, 
              double price, int inventory, int64_t end_time = 0)
 {
@@ -849,6 +887,7 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
                     UserSession session;
                     session.user_id = user_id;
                     session.last_activity = chrono::steady_clock::now();
+                    session.ws = ws;
                     active_sessions[session_token] = session;
                 }
                 ws->send("LOGIN_SUCCESS|" + session_token + "|" + to_string(user_id));
@@ -958,7 +997,7 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
                         }
                     }
                 }
-                
+                send_cart_update_to_user(user_id);
                 ws->send("CART_UPDATED|Item added to cart");
             }
             else
@@ -1002,7 +1041,7 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
                         }
                     }
                 }
-                
+                send_cart_update_to_user(user_id);
                 ws->send("CART_UPDATED|Cart updated");
             }
             else
@@ -1078,6 +1117,7 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
             if (order_id > 0)
             {
                 ws->send("ORDER_CREATED|" + to_string(order_id));
+                send_cart_update_to_user(user_id);
             }
             else
             {
@@ -1117,6 +1157,53 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
             {
                 ws->send("ERROR|Payment processing failed");
             }
+        }
+        else if (parts[0] == "GET_ORDERS" && parts.size() == 2)
+        {
+            string session_token = parts[1];
+
+            int user_id = -1;
+            {
+                lock_guard<mutex> lock(sessions_mutex);
+                if (auto it = active_sessions.find(session_token); it != active_sessions.end())
+                {
+                    user_id = it->second.user_id;
+                }
+            }
+
+            if (user_id == -1)
+            {
+                ws->send("ERROR|Invalid session");
+                return;
+            }
+
+            // Query orders for this user
+            lock_guard<mutex> db_lock(db_mutex);
+            sqlite3_stmt *stmt;
+            const char *sql = "SELECT id, total_amount, status, created_at FROM orders WHERE user_id = ?";
+
+            if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK)
+            {
+                ws->send("ERROR|Failed to fetch orders");
+                return;
+            }
+
+            sqlite3_bind_int(stmt, 1, user_id);
+
+            stringstream response;
+            response << "ORDERS";
+            while (sqlite3_step(stmt) == SQLITE_ROW)
+            {
+                int id = sqlite3_column_int(stmt, 0);
+                double total = sqlite3_column_double(stmt, 1);
+                const char *status = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
+                const char *created_at = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 3));
+
+                response << "|" << id << "," << total << "," << status << "," << created_at;
+            }
+
+            sqlite3_finalize(stmt);
+            ws->send(response.str());
         }
         else if (parts[0] == "ADMIN" && parts.size() >= 5 && parts[2] == "ADD_ITEM")
         {

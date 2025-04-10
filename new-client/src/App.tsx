@@ -166,11 +166,17 @@ function App() {
       const orderId = rest[0];
       showNotification(`Order created with ID: ${orderId}`, 'success');
       if (socket) {
+
         socket.send(`GET_CART|${form.sessionToken}`);
         socket.send(`GET_ORDERS|${form.sessionToken}`);
+        socket.send(`PROCESS_PAYMENT|${orderId}|credit_card|${form.sessionToken}`);
       }
     } else if (type === 'PAYMENT_SUCCESS') {
       showNotification(`Payment successful! Transaction ID: ${rest[0]}`, 'success');
+      if (socket && form.sessionToken) {
+        socket.send(`GET_CART|${form.sessionToken}`);
+        socket.send(`GET_ORDERS|${form.sessionToken}`);
+      }
     } else if (type === 'AUCTION_ENDED') {
       const [itemId, , finalBid, winnerId] = rest[0].split(',');
       showNotification(`Auction ended: Item ${itemId} sold for $${finalBid} to user ${winnerId}`, 'success');
@@ -606,7 +612,8 @@ function App() {
 
   const CartView = () => {
     const [localCart, setLocalCart] = useState<CartItem[]>(cart);
-    const total = localCart.reduce((sum, { item, quantity }) => sum + item.fixedPrice * quantity, 0);
+    const total = cart.reduce((sum, { item, quantity }) => sum + item.fixedPrice * quantity, 0);
+    const [showCheckoutModal, setShowCheckoutModal] = useState(false);
 
     useEffect(() => {
       setLocalCart(cart);
@@ -673,13 +680,25 @@ function App() {
                 </table>
               </div>
               <div className="text-end">
-                <button
-                  className="btn btn-primary"
-                  onClick={handleCheckout}
-                  disabled={!socket || socket.readyState !== WebSocket.OPEN}
-                >
-                  Checkout
-                </button>
+              <button
+                className="btn btn-primary"
+                onClick={() => setShowCheckoutModal(true)}
+                disabled={!socket || socket.readyState !== WebSocket.OPEN}
+              >
+                Checkout
+              </button>
+
+                {showCheckoutModal && (
+                  <CheckoutModal
+                    total={total}
+                    onClose={() => setShowCheckoutModal(false)}
+                    onSubmit={(cardNumber: string) => {
+                      console.log('Order placed with card:', cardNumber);
+                      handleCheckout(); // still call the backend logic
+                      setShowCheckoutModal(false);
+                    }}
+                  />
+                )}
               </div>
             </>
           )}
@@ -865,7 +884,13 @@ function App() {
                   </div>
                 )}
 
-                {activeTab === 'cart' && <CartView />}
+                {activeTab === 'cart' && (
+                  <div className="row">
+                    <div className="col-12">
+                      <CartView />
+                    </div>
+                  </div>
+                )}
                 
                 {activeTab === 'orders' && <OrdersView />}
               </div>
@@ -898,5 +923,52 @@ function App() {
     </ErrorBoundary>
   );
 }
+
+interface CheckoutModalProps {
+  total: number;
+  onClose: () => void;
+  onSubmit: (cardNumber: string) => void;
+}
+
+function CheckoutModal({ total, onClose, onSubmit }: CheckoutModalProps) {
+  const [cardNumber, setCardNumber] = useState('');
+
+  return (
+    <div className="modal d-block" tabIndex={-1} style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
+      <div className="modal-dialog">
+        <div className="modal-content shadow-sm">
+          <div className="modal-header">
+            <h5 className="modal-title">Confirm Your Order</h5>
+            <button type="button" className="btn-close" onClick={onClose}></button>
+          </div>
+          <div className="modal-body">
+            <p>Total Cost: <strong>${total.toFixed(2)}</strong></p>
+            <div className="mb-3">
+              <label className="form-label">Card Number</label>
+              <input
+                type="text"
+                className="form-control"
+                placeholder="Enter card number"
+                value={cardNumber}
+                onChange={(e) => setCardNumber(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="modal-footer">
+            <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+            <button
+              className="btn btn-primary"
+              onClick={() => onSubmit(cardNumber)}
+              disabled={!cardNumber.trim()}
+            >
+              Place Order
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 
 export default App;
