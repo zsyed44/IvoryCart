@@ -1,5 +1,7 @@
-#include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocketServer.h>
+#include <ixwebsocket/IXWebSocket.h>
+#include <ixwebsocket/IXConnectionState.h>
+#include <ixwebsocket/IXNetSystem.h>
 #include <sqlite3.h>
 #include <iostream>
 #include <mutex>
@@ -13,6 +15,7 @@
 #include <ctime>
 #include <random>
 #include <algorithm>
+#include <unordered_set>
 
 using namespace std;
 
@@ -188,11 +191,34 @@ void broadcast(const string &message)
         clients_copy = connected_clients;
     }
 
+    cout << "Broadcasting message to " << clients_copy.size() << " clients: " << message << endl;
     for (auto &client : clients_copy)
     {
-        if (client)
+        if (client && client->getReadyState() == ix::ReadyState::Open)
+        {
             client->send(message);
+        }
     }
+}
+
+void broadcast_items_list()
+{
+    auto lock = items_monitor.get_lock();
+    stringstream response;
+    response << "ITEMS_LIST";
+    for (const auto &[id, item] : items)
+    {
+        response << "|" << id << "," 
+                 << item.name << ","
+                 << item.listing_type << ","
+                 << item.current_bid << ","
+                 << item.fixed_price << ","
+                 << item.inventory << ","
+                 << item.bidder_id << ","
+                 << item.end_time;
+    }
+    cout << "Broadcasting updated items list" << endl;
+    broadcast(response.str());
 }
 
 // --------------------------
@@ -286,12 +312,11 @@ void seed_test_data()
 
     // Get current time
     int64_t now = time(nullptr);
-    int64_t one_day = 24 * 60 * 60;
     
     // Clear existing items
     sqlite3_exec(db, "DELETE FROM items", 0, 0, 0);
     
-    // Create some auction items
+    // Create some auction items with short durations
     sqlite3_stmt *auction_stmt;
     const char *auction_sql = 
         "INSERT INTO items (name, description, listing_type, current_bid, inventory, end_time) VALUES "
@@ -299,27 +324,19 @@ void seed_test_data()
     
     if (sqlite3_prepare_v2(db, auction_sql, -1, &auction_stmt, nullptr) == SQLITE_OK)
     {
-        // Item 1: Ending in 1 hour
-        sqlite3_bind_text(auction_stmt, 1, "Antique Chair", -1, SQLITE_STATIC);
-        sqlite3_bind_text(auction_stmt, 2, "A beautiful handcrafted chair from the 18th century", -1, SQLITE_STATIC);
-        sqlite3_bind_double(auction_stmt, 3, 100.0);
-        sqlite3_bind_int64(auction_stmt, 4, now + 3600);  // 1 hour from now
+        // Item 1: Ending in 2 minutes
+        sqlite3_bind_text(auction_stmt, 1, "Quick Auction Item", -1, SQLITE_STATIC);
+        sqlite3_bind_text(auction_stmt, 2, "Auction ending in 2 minutes", -1, SQLITE_STATIC);
+        sqlite3_bind_double(auction_stmt, 3, 10.0);
+        sqlite3_bind_int64(auction_stmt, 4, now + 120);  // 2 minutes from now
         sqlite3_step(auction_stmt);
         sqlite3_reset(auction_stmt);
         
-        // Item 2: Ending in 1 day
-        sqlite3_bind_text(auction_stmt, 1, "Vintage Painting", -1, SQLITE_STATIC);
-        sqlite3_bind_text(auction_stmt, 2, "An original oil painting from a renowned artist", -1, SQLITE_STATIC);
-        sqlite3_bind_double(auction_stmt, 3, 500.0);
-        sqlite3_bind_int64(auction_stmt, 4, now + one_day);
-        sqlite3_step(auction_stmt);
-        sqlite3_reset(auction_stmt);
-        
-        // Item 3: Ending in 3 days
-        sqlite3_bind_text(auction_stmt, 1, "Rare Coin Collection", -1, SQLITE_STATIC);
-        sqlite3_bind_text(auction_stmt, 2, "A collection of rare coins from around the world", -1, SQLITE_STATIC);
-        sqlite3_bind_double(auction_stmt, 3, 1000.0);
-        sqlite3_bind_int64(auction_stmt, 4, now + 3 * one_day);
+        // Item 2: Ending in 4 minutes
+        sqlite3_bind_text(auction_stmt, 1, "Medium Auction Item", -1, SQLITE_STATIC);
+        sqlite3_bind_text(auction_stmt, 2, "Auction ending in 4 minutes", -1, SQLITE_STATIC);
+        sqlite3_bind_double(auction_stmt, 3, 20.0);
+        sqlite3_bind_int64(auction_stmt, 4, now + 240);  // 4 minutes from now
         sqlite3_step(auction_stmt);
         
         sqlite3_finalize(auction_stmt);
@@ -339,23 +356,6 @@ void seed_test_data()
         sqlite3_bind_double(fixed_stmt, 3, 299.99);
         sqlite3_bind_int(fixed_stmt, 4, 5);
         sqlite3_step(fixed_stmt);
-        sqlite3_reset(fixed_stmt);
-        
-        // Item 2
-        sqlite3_bind_text(fixed_stmt, 1, "Smartphone", -1, SQLITE_STATIC);
-        sqlite3_bind_text(fixed_stmt, 2, "The latest smartphone with advanced features", -1, SQLITE_STATIC);
-        sqlite3_bind_double(fixed_stmt, 3, 699.99);
-        sqlite3_bind_int(fixed_stmt, 4, 10);
-        sqlite3_step(fixed_stmt);
-        sqlite3_reset(fixed_stmt);
-        
-        // Item 3
-        sqlite3_bind_text(fixed_stmt, 1, "Leather Jacket", -1, SQLITE_STATIC);
-        sqlite3_bind_text(fixed_stmt, 2, "A genuine leather jacket, perfect for all seasons", -1, SQLITE_STATIC);
-        sqlite3_bind_double(fixed_stmt, 3, 199.99);
-        sqlite3_bind_int(fixed_stmt, 4, 8);
-        sqlite3_step(fixed_stmt);
-        
         sqlite3_finalize(fixed_stmt);
     }
 }
@@ -371,7 +371,8 @@ void process_bid(Item &item, int user_id, double amount)
     }
     
     // Check if auction has ended
-    if (item.end_time > 0 && item.end_time < time(nullptr)) {
+    if (item.end_time > 0 && item.end_time <= time(nullptr)) {
+        cout << "Cannot bid on ended auction" << endl;
         return;
     }
 
@@ -462,46 +463,58 @@ bool add_to_cart(int user_id, int item_id, int quantity)
     
     // First, check if the item exists and has enough inventory
     sqlite3_stmt *check_stmt;
-    const char *check_sql = "SELECT listing_type, inventory FROM items WHERE id = ?";
+    const char *check_sql = "SELECT listing_type, inventory, current_bid FROM items WHERE id = ?";
     
     if (sqlite3_prepare_v2(db, check_sql, -1, &check_stmt, nullptr) != SQLITE_OK) {
+        cout << "Failed to prepare check statement" << endl;
         return false;
     }
     
     sqlite3_bind_int(check_stmt, 1, item_id);
     
     if (sqlite3_step(check_stmt) != SQLITE_ROW) {
+        cout << "Item not found" << endl;
         sqlite3_finalize(check_stmt);
         return false;
     }
     
     string listing_type = reinterpret_cast<const char *>(sqlite3_column_text(check_stmt, 0));
     int inventory = sqlite3_column_int(check_stmt, 1);
+    double current_bid = sqlite3_column_double(check_stmt, 2);
     
     sqlite3_finalize(check_stmt);
     
-    // Only fixed-price items can be added to cart
-    if (listing_type != "fixed" || inventory < quantity) {
+    // For auction items, we don't check inventory
+    if (listing_type != "auction" && inventory < quantity) {
+        cout << "Not enough inventory" << endl;
         return false;
     }
     
     // Now add or update the cart
     sqlite3_stmt *upsert_stmt;
     const char *upsert_sql = 
-        "INSERT INTO cart (user_id, item_id, quantity) VALUES (?, ?, ?) "
-        "ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + ?";
+        "INSERT INTO cart (user_id, item_id, quantity, price) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = 1, price = ?";  // Always set quantity to 1 for auction items
     
     if (sqlite3_prepare_v2(db, upsert_sql, -1, &upsert_stmt, nullptr) != SQLITE_OK) {
+        cout << "Failed to prepare upsert statement" << endl;
         return false;
     }
     
     sqlite3_bind_int(upsert_stmt, 1, user_id);
     sqlite3_bind_int(upsert_stmt, 2, item_id);
     sqlite3_bind_int(upsert_stmt, 3, quantity);
-    sqlite3_bind_int(upsert_stmt, 4, quantity);
+    sqlite3_bind_double(upsert_stmt, 4, current_bid);
+    sqlite3_bind_double(upsert_stmt, 5, current_bid);
     
     bool success = sqlite3_step(upsert_stmt) == SQLITE_DONE;
     sqlite3_finalize(upsert_stmt);
+    
+    if (success) {
+        cout << "Successfully added item " << item_id << " to cart for user " << user_id << " with price " << current_bid << endl;
+    } else {
+        cout << "Failed to add item to cart" << endl;
+    }
     
     return success;
 }
@@ -630,6 +643,17 @@ void add_item(const string &name, const string &description, const string &listi
     lock_guard<mutex> db_lock(db_mutex);
     sqlite3_stmt *stmt;
     
+    cout << "Adding new item to database:" << endl;
+    cout << "Name: " << name << endl;
+    cout << "Description: " << description << endl;
+    cout << "Type: " << listing_type << endl;
+    cout << "Price: " << price << endl;
+    cout << "Inventory: " << inventory << endl;
+    if (end_time > 0) {
+        time_t end_time_t = static_cast<time_t>(end_time);
+        cout << "End time: " << end_time << " (" << ctime(&end_time_t) << ")" << endl;
+    }
+    
     const char *sql = 
         "INSERT INTO items (name, description, listing_type, current_bid, fixed_price, inventory, end_time) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)";
@@ -651,8 +675,15 @@ void add_item(const string &name, const string &description, const string &listi
         sqlite3_bind_int(stmt, 6, inventory);
         sqlite3_bind_int64(stmt, 7, end_time);
         
-        sqlite3_step(stmt);
+        int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_DONE) {
+            cout << "Successfully added item to database" << endl;
+        } else {
+            cerr << "Error adding item to database: " << sqlite3_errmsg(db) << endl;
+        }
         sqlite3_finalize(stmt);
+    } else {
+        cerr << "Error preparing statement: " << sqlite3_errmsg(db) << endl;
     }
     load_items_from_db();
 }
@@ -877,9 +908,19 @@ vector<string> split_string(const string &s, char delimiter)
 
 void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
 {
+    cout << "\n=== Received new message ===" << endl;
+    cout << "Raw message: " << msg << endl;
+    
     vector<string> parts = split_string(msg, '|');
-    if (parts.empty())
+    if (parts.empty()) {
+        cout << "Error: Empty message received" << endl;
         return;
+    }
+
+    cout << "Message parts: " << endl;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        cout << "Part " << i << ": " << parts[i] << endl;
+    }
 
     try
     {
@@ -920,6 +961,7 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
         }
         else if (parts[0] == "GET_ITEMS")
         {
+            cout << "Processing GET_ITEMS request" << endl;
             auto lock = items_monitor.get_lock();
             stringstream response;
             response << "ITEMS_LIST";
@@ -934,6 +976,7 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
                          << item.bidder_id << ","
                          << item.end_time;
             }
+            cout << "Sending items list response" << endl;
             ws->send(response.str());
         }
         else if (parts[0] == "BID" && parts.size() == 4)
@@ -1266,6 +1309,7 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
 
         else if (parts[0] == "ADMIN" && parts.size() >= 5 && parts[2] == "ADD_ITEM")
         {
+            cout << "Processing ADMIN command" << endl;
             string session_token = parts[1];
             int user_id = -1;
             {
@@ -1273,11 +1317,13 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
                 if (auto it = active_sessions.find(session_token); it != active_sessions.end())
                 {
                     user_id = it->second.user_id;
+                    cout << "Found user ID: " << user_id << endl;
                 }
             }
 
             if (user_id != 1) // Assuming admin has ID 1
             {
+                cout << "User is not admin (ID: " << user_id << ")" << endl;
                 ws->send("ERROR|Admin privileges required");
                 return;
             }
@@ -1291,23 +1337,39 @@ void handle_message(const string &msg, shared_ptr<ix::WebSocket> ws)
                 string description = parts.size() > 7 ? parts[7] : name;
                 int64_t end_time = 0;
                 
+                cout << "Processing new item:" << endl;
+                cout << "Name: " << name << endl;
+                cout << "Type: " << listing_type << endl;
+                cout << "Price: " << price << endl;
+                cout << "Inventory: " << inventory << endl;
+                cout << "Description: " << description << endl;
+                
                 if (listing_type == "auction" && parts.size() > 8) {
                     // Duration in hours
                     int duration = stoi(parts[8]);
                     end_time = time(nullptr) + duration * 3600;
+                    time_t end_time_t = static_cast<time_t>(end_time);
+                    cout << "Auction duration: " << duration << " hours" << endl;
+                    cout << "End time: " << ctime(&end_time_t);
                 }
                 
                 add_item(name, description, listing_type, price, inventory, end_time);
+                
+                // Broadcast the updated items list to all clients
+                broadcast_items_list();
+                
                 ws->send("ADMIN_SUCCESS|Item added: " + name);
             }
             catch (const exception &e)
             {
+                cerr << "Error processing admin command: " << e.what() << endl;
                 ws->send("ERROR|Invalid item parameters");
             }
         }
     }
     catch (const exception &e)
     {
+        cerr << "Error processing message: " << e.what() << endl;
         ws->send("ERROR|Invalid message format");
     }
 }
@@ -1347,51 +1409,88 @@ void bid_processor_thread()
 
 void auction_end_processor_thread()
 {
+    unordered_set<int> processed_items;
+    
     while (true)
     {
-        this_thread::sleep_for(chrono::seconds(5));
+        this_thread::sleep_for(chrono::seconds(30)); // Check every 30 seconds
         
-        auto now = time(nullptr);
-        vector<pair<Item, int>> ended_auctions;
+        auto now = chrono::system_clock::now();
+        auto now_time = chrono::system_clock::to_time_t(now);
         
-        // Find ended auctions with bidders
         {
             auto lock = items_monitor.get_lock();
             for (auto &[item_id, item] : items)
             {
                 if (item.listing_type == "auction" && 
-                    item.end_time > 0 && 
-                    item.end_time <= now && 
-                    item.bidder_id > 0)
+                    item.end_time <= now_time && 
+                    item.bidder_id != -1 &&
+                    processed_items.find(item_id) == processed_items.end())
                 {
-                    ended_auctions.emplace_back(item, 1);  // Quantity is always 1 for auction items
-                }
-            }
-        }
-        
-        // Process each ended auction into an order
-        for (const auto &[item, quantity] : ended_auctions)
-        {
-            vector<pair<Item, int>> order_items = { {item, quantity} };
-            int order_id = create_order(item.bidder_id, order_items, false);
-            
-            if (order_id > 0)
-            {
-                // Broadcast notification to all users
-                broadcast("AUCTION_ENDED|" + to_string(item.id) + "," + 
-                         item.name + "," + to_string(item.current_bid) + "," + 
-                         to_string(item.bidder_id) + "," + to_string(order_id));
-                
-                // Update auction end time to 0 to mark it as processed
-                lock_guard<mutex> db_lock(db_mutex);
-                sqlite3_stmt *update_stmt;
-                const char *update_sql = "UPDATE items SET end_time = 0 WHERE id = ?";
-                
-                if (sqlite3_prepare_v2(db, update_sql, -1, &update_stmt, nullptr) == SQLITE_OK)
-                {
-                    sqlite3_bind_int(update_stmt, 1, item.id);
-                    sqlite3_step(update_stmt);
-                    sqlite3_finalize(update_stmt);
+                    cout << "Processing ended auction for item " << item_id << " with winner " << item.bidder_id << endl;
+                    
+                    // Add item to winner's cart
+                    {
+                        lock_guard<mutex> db_lock(db_mutex);
+                        sqlite3_stmt *stmt;
+                        const char *sql = "INSERT OR REPLACE INTO cart (user_id, item_id, quantity) VALUES (?, ?, 1)";
+                        
+                        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK)
+                        {
+                            sqlite3_bind_int(stmt, 1, item.bidder_id);
+                            sqlite3_bind_int(stmt, 2, item_id);
+                            
+                            if (sqlite3_step(stmt) == SQLITE_DONE)
+                            {
+                                cout << "Successfully added item " << item_id << " to winner's cart" << endl;
+                                
+                                // Broadcast notification to all users
+                                stringstream notification;
+                                notification << "AUCTION_ENDED|" << item_id << "," 
+                                           << item.name << "," 
+                                           << item.current_bid << "," 
+                                           << item.bidder_id;
+                                broadcast(notification.str());
+                                
+                                // Send cart update to the winner
+                                send_cart_update_to_user(item.bidder_id);
+                                
+                                // Update the items list for all clients
+                                broadcast_items_list();
+                                
+                                // Mark this item as processed
+                                processed_items.insert(item_id);
+                                
+                                // Send immediate cart update to winner
+                                {
+                                    lock_guard<mutex> session_lock(sessions_mutex);
+                                    for (const auto &[token, session] : active_sessions)
+                                    {
+                                        if (session.user_id == item.bidder_id)
+                                        {
+                                            if (auto ws_ptr = session.ws.lock())
+                                            {
+                                                stringstream cart_message;
+                                                cart_message << "CART_UPDATED|Item added to cart";
+                                                ws_ptr->send(cart_message.str());
+                                                ws_ptr->send("GET_CART|" + token);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                cout << "Failed to add item " << item_id << " to winner's cart" << endl;
+                            }
+                            sqlite3_finalize(stmt);
+                        }
+                        else
+                        {
+                            cout << "Failed to prepare upsert statement: " << sqlite3_errmsg(db) << endl;
+                        }
+                    }
                 }
             }
         }
@@ -1443,9 +1542,17 @@ int main()
             auto webSocket = weakWebSocket.lock();
             if (webSocket)
             {
+                cout << "New client connected" << endl;
+                
                 // Add to connected clients
                 {
                     lock_guard<mutex> lock(clients_mutex);
+                    // Remove any existing connection for this client
+                    auto it = find(connected_clients.begin(), connected_clients.end(), webSocket);
+                    if (it != connected_clients.end()) {
+                        (*it)->close();
+                        connected_clients.erase(it);
+                    }
                     connected_clients.push_back(webSocket);
                 }
 
@@ -1459,6 +1566,7 @@ int main()
                         // Handle close event
                         if (msg->type == ix::WebSocketMessageType::Close)
                         {
+                            cout << "Client disconnected" << endl;
                             lock_guard<mutex> lock(clients_mutex);
                             auto it = find(connected_clients.begin(), 
                                         connected_clients.end(), ws);
@@ -1472,6 +1580,7 @@ int main()
                         // Handle other message types
                         if (msg->type == ix::WebSocketMessageType::Message)
                         {
+                            cout << "Received WebSocket message" << endl;
                             handle_message(msg->str, ws);
                         }
                     });

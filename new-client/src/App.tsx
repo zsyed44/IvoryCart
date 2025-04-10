@@ -28,6 +28,15 @@ interface Order {
   items: CartItem[];
 }
 
+interface Notification {
+  message: string;
+  type: 'success' | 'error' | 'auction';
+  auctionItem?: {
+    name: string;
+    price: number;
+  };
+}
+
 class ErrorBoundary extends React.Component<{ children: React.ReactNode }> {
   state = { hasError: false };
 
@@ -65,32 +74,33 @@ function App() {
     newItemDuration: '24' // hours
   });
   const [isAdmin, setIsAdmin] = useState(false);
-  const [notification, setNotification] = useState<{
-    message: string;
-    type: 'success' | 'error'
-  } | null>(null);
+  const [notification, setNotification] = useState<Notification | null>(null);
   const [isConnecting, setIsConnecting] = useState(true);
+  const [reconnectAttempts, setReconnectAttempts] = useState(0);
+  const MAX_RECONNECT_ATTEMPTS = 5;
   const [activeTab, setActiveTab] = useState<'auctions' | 'shop' | 'cart' | 'orders'>('auctions');
 
   const handleMessage = (event: MessageEvent) => {
     const [type, ...rest] = event.data.split('|');
-    console.log('Received message:', type, rest); // Debug log
+    console.log('Received message:', type, rest);
 
     if (type === 'LOGIN_SUCCESS') {
+      console.log('Login successful, user ID:', rest[1]);
       setForm(prev => ({ ...prev, sessionToken: rest[0] }));
       setIsAdmin(rest[1] === '1');
       showNotification('Login successful!', 'success');
-      if (socket) {
+      if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send('GET_ITEMS');
         socket.send(`GET_CART|${rest[0]}`);
         socket.send(`GET_ORDERS|${rest[0]}`);
       }
     } else if (type === 'GET_ITEMS') {
       // Server is requesting items, send them
-      if (socket) {
+      if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send('GET_ITEMS');
       }
     } else if (type === 'ITEMS_LIST') {
+      console.log('Received items list:', rest);
       const newItems = rest.map((item: string) => {
         const [id, name, listingType, currentBid, fixedPrice, inventory, bidderId, endTime] = item.split(',');
         return {
@@ -106,6 +116,7 @@ function App() {
           version: 1
         };
       });
+      console.log('Processed items:', newItems);
       setItems(newItems);
     } else if (type === 'ITEM_UPDATE') {
       const [id, name, listingType, currentBid, fixedPrice, inventory, bidderId, endTime] = rest[0].split(',');
@@ -179,17 +190,26 @@ function App() {
         socket.send(`GET_ORDERS|${form.sessionToken}`);
       }
     } else if (type === 'AUCTION_ENDED') {
-      const [itemId, , finalBid, winnerId] = rest[0].split(',');
-      showNotification(`Auction ended: Item ${itemId} sold for $${finalBid} to user ${winnerId}`, 'success');
+      const [itemId, itemName, finalBid, winnerId] = rest[0].split(',');
+      const currentUserId = form.sessionToken.split('|')[1]; // Assuming session token contains user ID
+      
+      if (currentUserId === winnerId) {
+        showNotification(`You won the auction for ${itemName}!`, 'success');
+        // Request updated cart
+        if (socket && form.sessionToken) {
+          socket.send(`GET_CART|${form.sessionToken}`);
+        }
+      }
     } else if (type === 'ADMIN_SUCCESS') {
+      console.log('Admin action successful:', rest);
       showNotification(rest.join('|'), 'success');
-      if (socket) {
+      // Request updated items list
+      if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send('GET_ITEMS');
       }
     } else if (type === 'ERROR') {
-      const errorMessage = rest.join('|');
-      showNotification(errorMessage, 'error');
-      console.error('Server error:', errorMessage);
+      console.error('Server error:', rest);
+      showNotification(rest.join('|'), 'error');
     } else if (type === 'ORDERS_LIST') {
       const newOrders: Order[] = rest.map((order: string) => {
         const [id, totalAmount, status, itemsStr] = order.split(',');
@@ -224,20 +244,31 @@ function App() {
   };
 
   useEffect(() => {
-    let ws: WebSocket;
+    let ws: WebSocket | null = null;
     let reconnectTimeout: NodeJS.Timeout;
     let isMounted = true;
 
     const connect = () => {
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        showNotification('Maximum reconnection attempts reached. Please refresh the page.', 'error');
+        return;
+      }
+
       setIsConnecting(true);
       try {
         ws = new WebSocket('ws://localhost:8080');
 
         ws.onopen = () => {
-          if (!isMounted) return;
+          if (!isMounted || !ws) return;
           console.log('Connected to WebSocket server');
           setSocket(ws);
           setIsConnecting(false);
+          setReconnectAttempts(0);
           if (form.sessionToken) {
             ws.send('GET_ITEMS');
             ws.send(`GET_CART|${form.sessionToken}`);
@@ -246,14 +277,17 @@ function App() {
 
         ws.onmessage = (event) => {
           console.log("[WS] Raw message from server:", event.data);
-          if (!isMounted) return;
+          if (!isMounted || !ws) return;
           handleMessage(event);
         };
 
         ws.onclose = (event) => {
           if (!isMounted) return;
+          console.log('WebSocket closed:', event.code, event.reason);
+          setSocket(null);
           if (!event.wasClean) {
-            showNotification('Connection lost. Reconnecting...', 'error');
+            setReconnectAttempts(prev => prev + 1);
+            showNotification(`Connection lost. Reconnecting... (Attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})`, 'error');
             reconnectTimeout = setTimeout(connect, 3000);
           }
         };
@@ -262,11 +296,15 @@ function App() {
           if (!isMounted) return;
           console.error('WebSocket error:', error);
           showNotification('Connection error', 'error');
+          if (ws) {
+            ws.close();
+          }
         };
 
       } catch (error) {
         console.error('WebSocket creation error:', error);
         showNotification('Connection failed', 'error');
+        setReconnectAttempts(prev => prev + 1);
         reconnectTimeout = setTimeout(connect, 3000);
       }
     };
@@ -279,9 +317,11 @@ function App() {
       if (ws) {
         ws.onmessage = null;
         ws.close();
+        ws = null;
       }
+      setSocket(null);
     };
-  }, [form.sessionToken]);
+  }, [form.sessionToken, reconnectAttempts]);
 
   const showNotification = (message: string, type: 'success' | 'error') => {
     setNotification({ message, type });
@@ -474,7 +514,16 @@ function App() {
                   return;
                 }
 
-                const params = [
+                console.log('Adding new item:', {
+                  name: form.newItemName,
+                  type: form.newItemType,
+                  price: form.newItemPrice,
+                  inventory: form.newItemInventory,
+                  duration: form.newItemDuration
+                });
+
+                const message = [
+                  'ADMIN',  // Command type first
                   form.sessionToken,
                   'ADD_ITEM',
                   form.newItemName,
@@ -483,9 +532,12 @@ function App() {
                   form.newItemInventory,
                   form.newItemDescription,
                   form.newItemType === 'auction' ? form.newItemDuration : undefined
-                ].filter(Boolean);
+                ].filter(Boolean).join('|');
 
-                socket.send(params.join('|'));
+                console.log('Sending admin message:', message);
+                socket.send(message);
+
+                // Reset form
                 setForm(prev => ({
                   ...prev,
                   newItemName: '',
@@ -768,6 +820,29 @@ function App() {
     </div>
   );
 
+  const NotificationPopup = () => {
+    if (!notification) return null;
+
+    return (
+      <div className={`alert alert-${notification.type === 'error' ? 'danger' : 'success'} position-fixed top-0 end-0 m-3`} 
+           style={{ zIndex: 1000 }}>
+        {notification.message}
+        {notification.type === 'auction' && notification.auctionItem && (
+          <div className="mt-2">
+            <p>Item: {notification.auctionItem.name}</p>
+            <p>Winning Bid: ${notification.auctionItem.price.toFixed(2)}</p>
+            <p>Item has been added to your cart!</p>
+          </div>
+        )}
+        <button 
+          type="button" 
+          className="btn-close position-absolute top-0 end-0 m-2" 
+          onClick={() => setNotification(null)}
+        />
+      </div>
+    );
+  };
+
   return (
     <ErrorBoundary>
       <div className="min-vh-100 bg-light">
@@ -924,6 +999,7 @@ function App() {
           )}
         </div>
       </div>
+      <NotificationPopup />
     </ErrorBoundary>
   );
 }
