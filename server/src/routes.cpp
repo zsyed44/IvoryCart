@@ -1,16 +1,43 @@
 #include "crow.h"
 #include "services.h"
 #include "database.h"
+#include "auth.h"
+#include "auth.cpp"
 
 void setupRoutes(crow::SimpleApp& app, AuthService& auth, InventoryService& inventory, Storage& db) {
     CROW_ROUTE(app, "/api/login").methods("POST"_method)
     ([&auth](const crow::request& req) {
         auto json = crow::json::load(req.body);
-        std::string token = auth.login(json["email"].s(), json["password"].s());
-        crow::json::wvalue result;
-        result["token"] = token;
-        return crow::response{200, result};
+        try {
+            std::string token = auth.login(json["email"].s(), json["password"].s());
+            crow::json::wvalue result;
+            result["token"] = token;
+            return crow::response{200, result};
+        } catch (const std::runtime_error& e) {
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response{401, error};
+        }
     });
+    
+    CROW_ROUTE(app, "/api/register").methods("POST"_method)
+    ([&auth](const crow::request& req) {
+        auto json = crow::json::load(req.body);
+        try {
+            std::string name = json["name"].s();
+            std::string email = json["email"].s();
+            std::string password = json["password"].s();
+            std::string message = auth.registerUser(name, email, password);
+            crow::json::wvalue result;
+            result["message"] = message;
+            return crow::response{201, result};
+        } catch (const std::runtime_error& e) {
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response{400, error};
+        }
+    });
+
 
     CROW_ROUTE(app, "/api/products").methods("GET"_method)
     ([&db]() {
