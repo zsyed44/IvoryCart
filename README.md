@@ -16,9 +16,9 @@
 - **Database**: A SQLITE relational database that stores users, products, orders, and other information.
 
 ## Technologies Used
-- **Frontend**: HTML, CSS, JavaScript (Framework TBD)
+- **Frontend**: HTML, CSS, TypeScript, React
 - **Backend**: C++ (Using processes liking forking, and multi-threading)
-- **Database**: MySQL/PostgreSQL
+- **Database**: SQLite
 - **Security**: Encrypted transactions, secure authentication
 
 ## Installation
